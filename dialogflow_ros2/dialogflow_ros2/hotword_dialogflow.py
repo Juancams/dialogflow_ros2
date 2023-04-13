@@ -1,5 +1,5 @@
 # Snowboy
-from snowboy import snowboydecoder
+from .snowboy import snowboydecoder
 # Dialogflow
 from dialogflow_ros import DialogflowClient
 # ROS
