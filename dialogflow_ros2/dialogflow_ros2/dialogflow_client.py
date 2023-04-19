@@ -13,14 +13,16 @@
 # limitations under the License.
 
 import google.cloud.dialogflow
-from google.cloud.dialogflow import Context, EventInput, QueryInput, QueryParameters
-from google.cloud.dialogflow import AudioEncoding, InputAudioConfig, OutputAudioConfig, OutputAudioEncoding
+from google.cloud.dialogflow import Context, EventInput, QueryInput, QueryParameters, TextInput
+from google.cloud.dialogflow import AudioEncoding, InputAudioConfig, OutputAudioConfig, OutputAudioEncoding, StreamingDetectIntentRequest
 from dialogflow_ros2_interfaces.msg import *
 # from google.cloud.dialogflow.services.sessions import SessionsClient
 # from google.api_core.exceptions import InvalidArgument
+from google.oauth2 import service_account
 
 import google.api_core.exceptions
-from dialogflow_ros2 import utils
+from dialogflow_ros2.utils.converters import *
+from dialogflow_ros2.utils.output import *
 from .AudioServerStream import AudioServerStream
 from .MicrophoneStream import MicrophoneStream
 # from ament_index_python import get_packages
@@ -37,7 +39,7 @@ import pathlib
 # ROS 2
 import rclpy
 from rclpy.node import Node
-
+from std_srvs.srv import Empty
 from std_msgs.msg import String
 
 class DialogflowClient(Node):
@@ -45,13 +47,26 @@ class DialogflowClient(Node):
         """Initialize all params and load data"""
         """ Constants and params """
         super().__init__("dialogflow_client")
+
+        self.declare_parameter('use_audio_server', False)
+        self.declare_parameter('play_audio', False)
+        self.declare_parameter('debug', False)
+        self.declare_parameter('default_language', 'en-US.UTF-8')
+        self.declare_parameter('project_id', 'my-project-id')
+        self.declare_parameter('google_application_credentials', 'df_api.json')
+
         self.CHUNK = 4096
         self.FORMAT = pyaudio.paInt16
         self.CHANNELS = 1
         self.RATE = 16000
-        self.USE_AUDIO_SERVER = self.get_parameter_or('/dialogflow_client/use_audio_server', False)
-        self.PLAY_AUDIO = self.get_parameter_or('/dialogflow_client/play_audio', True)
-        self.DEBUG = self.get_parameter_or('/dialogflow_client/debug', False)
+        self.USE_AUDIO_SERVER = self.get_parameter('use_audio_server').value
+        self.PLAY_AUDIO = self.get_parameter('play_audio').value
+        self.DEBUG = self.get_parameter('debug').value
+
+        self._language_code = self.get_parameter('default_language').value
+
+        google_application_credentials = self.get_parameter('google_application_credentials').value
+        self.credentials = service_account.Credentials.from_service_account_file(google_application_credentials)
 
         # Register Ctrl-C sigint
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -59,8 +74,7 @@ class DialogflowClient(Node):
         """ Dialogflow setup """
         # Get hints/clues
         file_dir = str(pathlib.Path(__file__).parent.resolve()).removesuffix('/dialogflow_ros2') + '/config/context.yaml'
-        # rp = get_packages()
-        # file_dir = rp.get_path('dialogflow_ros') + '/config/context.yaml' ### ---------
+
         with open(file_dir, 'r') as f:
             try:
                 self.phrase_hints = load(f)
@@ -68,7 +82,7 @@ class DialogflowClient(Node):
                 self.phrase_hints = []
 
         # Dialogflow params
-        project_id = self.get_parameter_or('/dialogflow_client/project_id', 'my-project-id')
+        project_id = self.get_parameter('project_id').value
         session_id = str(uuid4())  # Random
         self._language_code = language_code
         self.last_contexts = last_contexts if last_contexts else []
@@ -92,21 +106,17 @@ class DialogflowClient(Node):
                                         '/dialogflow_client/results')
         requests_topic = self.get_parameter_or('/dialogflow_client/requests_topic',
                                          '/dialogflow_client/requests')
+
+        self._results_pub = self.create_publisher(DialogflowResult, results_topic, 1)
         text_req_topic = requests_topic + '/string_msg'
-        text_event_topic = requests_topic + '/string_event'
-        msg_req_topic = requests_topic + '/df_msg'
-        event_req_topic = requests_topic + '/df_event'
-        # self._results_pub = self.create_publisher(results_topic, DialogflowResult,
-        #                                     queue_size=10)
         self.create_subscription(String, text_req_topic, self._text_request_cb, 1)
-        self.create_subscription(String, text_event_topic, self._text_event_cb, 1)
-        self.create_subscription(DialogflowRequest, msg_req_topic, self._msg_request_cb, 1)
-        self.create_subscription(DialogflowEvent, event_req_topic, self._event_request_cb, 1)
+        self.start_srv_ = self.create_service(Empty, '/dialogflow_client/start', self.start_dialog_cb)
+        self.state_srv_ = self.create_service(Empty, '/dialogflow_client/stop', self.stop_dialog_cb)
 
         """ Audio setup """
         # Mic stream input setup
         self.audio = pyaudio.PyAudio()
-        self._server_name = self.get_parameter_or('/dialogflow_client/server_name',
+        self._server_name = self.get_parameter_or('/server_name',
                                             '127.0.0.1')
         self._port = self.get_parameter_or('/dialogflow_client/port', 4444)
 
@@ -139,12 +149,25 @@ class DialogflowClient(Node):
         """
         :param msg: DialogflowEvent Message
         :type msg: DialogflowEvent"""
-        new_event = utils.converters.events_msg_to_struct(msg)
+        new_event = events_msg_to_struct(msg)
         self.event_intent(new_event)
 
     def _text_event_cb(self, msg):
         new_event = EventInput(name=msg.data, language_code=self._language_code)
         self.event_intent(new_event)
+
+    def start_dialog_cb(self, req, res):
+        self.get_logger().warning("[dialogflow_client] Start cb")
+        self.detect_intent_stream()
+        return res
+    
+    def stop_dialog_cb(self,req, res):
+        self._responses.cancel()
+        return res
+    
+    # ================================== #
+    #           Setters/Getters          #
+    # ================================== #
 
     def get_language_code(self):
         return self._language_code
@@ -153,8 +176,16 @@ class DialogflowClient(Node):
         assert isinstance(language_code, str), "Language code must be a string!"
         self._language_code = language_code
 
+    # ==================================== #
+    #           Utility Functions          #
+    # ==================================== #
+
     def _signal_handler(self, signal, frame):
         self.exit()
+
+    # ----------------- #
+    #  Audio Utilities  #
+    # ----------------- #
 
     def _create_audio_output(self):
         """Creates a PyAudio output stream."""
@@ -172,6 +203,10 @@ class DialogflowClient(Node):
         time.sleep(0.2)  # Wait for stream to finish
         self.stream_out.stop_stream()
 
+    # -------------- #
+    #  DF Utilities  #
+    # -------------- #
+
     def _generator(self):
         """Generator function that continuously yields audio chunks from the
         buffer. Used to stream data to the Google Speech API Asynchronously.
@@ -181,12 +216,9 @@ class DialogflowClient(Node):
         """
         # First message contains session, query_input, and params
         query_input = QueryInput(audio_config=self._audio_config)
-        contexts = utils.converters.contexts_msg_to_struct(self.last_contexts)
-        params = QueryParameters(contexts=contexts)
         req = StreamingDetectIntentRequest(
                 session=self._session,
                 query_input=query_input,
-                query_params=params,
                 single_utterance=True,
                 output_audio_config=self._output_audio_config
         )
@@ -203,6 +235,10 @@ class DialogflowClient(Node):
                 for content in audio_generator:
                     yield StreamingDetectIntentRequest(input_audio=content)
 
+    # ======================================== #
+    #           Dialogflow Functions           #
+    # ======================================== #
+
     def detect_intent_text(self, msg):
         """Use the Dialogflow API to detect a user's intent. Goto the Dialogflow
         console to define intents and params.
@@ -214,8 +250,8 @@ class DialogflowClient(Node):
         text_input = TextInput(text=msg.query_text, language_code=self._language_code)
         query_input = QueryInput(text=text_input)
         # Create QueryParameters
-        user_contexts = utils.converters.contexts_msg_to_struct(msg.contexts)
-        self.last_contexts = utils.converters.contexts_msg_to_struct(self.last_contexts)
+        user_contexts = contexts_msg_to_struct(msg.contexts)
+        self.last_contexts = contexts_msg_to_struct(self.last_contexts)
         contexts = self.last_contexts + user_contexts
         params = QueryParameters(contexts=contexts)
         try:
@@ -230,16 +266,16 @@ class DialogflowClient(Node):
                           "took too long or you aren't connected to the internet!")
         else:
             # Store context for future use
-            self.last_contexts = utils.converters.contexts_struct_to_msg(
+            self.last_contexts = contexts_struct_to_msg(
                     response.query_result.output_contexts
             )
-            df_msg = utils.converters.result_struct_to_msg(
+            df_msg = result_struct_to_msg(
                     response.query_result)
-            self.get_logger().info(utils.output.print_result(response.query_result))
+            self._results_pub.publish(df_msg) 
+            self.get_logger().info(print_result(response.query_result))
             # Play audio
             if self.PLAY_AUDIO:
                 self._play_stream(response.output_audio)
-            self._results_pub.publish(df_msg)
             return df_msg
         
     def detect_intent_stream(self, return_result=False):
@@ -248,25 +284,25 @@ class DialogflowClient(Node):
 
         # Generator yields audio chunks.
         requests = self._generator()
-        responses = self._session_cli.streaming_detect_intent(requests)
-        resp_list = []
         try:
-            for response in responses:
+            self._responses = self._session_cli.streaming_detect_intent(requests)
+            resp_list = []
+            for response in self._responses:
                 resp_list.append(response)
-                self.get_logger().debug(
+                self.get_logger().info(
                         'DF_CLIENT: Intermediate transcript: "{}".'.format(
                                 response.recognition_result.transcript))
         except google.api_core.exceptions.Cancelled as c:
-            self.get_logger().warning("DF_CLIENT: Caught a Google API Client cancelled "
+            self.get_logger().info("DF_CLIENT: Caught a Google API Client cancelled "
                           "exception. Check request format!:\n{}".format(c))
         except google.api_core.exceptions.Unknown as u:
-            self.get_logger().warning("DF_CLIENT: Unknown Exception Caught:\n{}".format(u))
+            self.get_logger().info("DF_CLIENT: Unknown Exception Caught:\n{}".format(u))
         except google.api_core.exceptions.ServiceUnavailable:
-            self.get_logger().warning("DF_CLIENT: Deadline exceeded exception caught. The response "
+            self.get_logger().info("DF_CLIENT: Deadline exceeded exception caught. The response "
                           "took too long or you aren't connected to the internet!")
         else:
             if response is None:
-                self.get_logger().warning("DF_CLIENT: No response received!")
+                self.get_logger().info("DF_CLIENT: No response received!")
                 return None
             # The response list returns responses in the following order:
             # 1. All intermediate recognition results
@@ -274,11 +310,11 @@ class DialogflowClient(Node):
             # 3. The output audio with config
             final_result = resp_list[-2].query_result
             final_audio = resp_list[-1]
-            self.last_contexts = utils.converters.contexts_struct_to_msg(
+            self.last_contexts = contexts_struct_to_msg(
                     final_result.output_contexts
             )
-            df_msg = utils.converters.result_struct_to_msg(final_result)
-            self.get_logger().info(utils.output.print_result(final_result))
+            df_msg = result_struct_to_msg(final_result)
+            self.get_logger().info(print_result(final_result))
             # Play audio
             if self.PLAY_AUDIO:
                 self._play_stream(final_audio.output_audio)
@@ -296,12 +332,12 @@ class DialogflowClient(Node):
         """
         # Convert if needed
         if type(event) is DialogflowEvent:
-            event_input = utils.converters.events_msg_to_struct(event)
+            event_input = events_msg_to_struct(event)
         else:
             event_input = event
 
         query_input = QueryInput(event=event_input)
-        params = utils.converters.create_query_parameters(
+        params = create_query_parameters(
                 contexts=self.last_contexts
         )
         response = self._session_cli.detect_intent(
@@ -310,7 +346,7 @@ class DialogflowClient(Node):
                 query_params=params,
                 output_audio_config=self._output_audio_config
         )
-        df_msg = utils.converters.result_struct_to_msg(response.query_result)
+        df_msg = result_struct_to_msg(response.query_result)
         if self.PLAY_AUDIO:
             self._play_stream(response.output_audio)
         return df_msg
@@ -330,4 +366,3 @@ def main(args=None):
 
 if __name__ == "__main__":
     main()
-    # df.detect_intent_stream()
