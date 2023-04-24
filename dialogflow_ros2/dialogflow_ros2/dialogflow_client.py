@@ -271,8 +271,9 @@ class DialogflowClient(Node):
             )
             df_msg = result_struct_to_msg(
                     response.query_result)
-            self._results_pub.publish(df_msg) 
-            self.get_logger().info(print_result(response.query_result))
+            self._results_pub.publish(df_msg)
+
+            # self.get_logger().info(print_result(response.query_result))
             # Play audio
             if self.PLAY_AUDIO:
                 self._play_stream(response.output_audio)
@@ -314,7 +315,7 @@ class DialogflowClient(Node):
                     final_result.output_contexts
             )
             df_msg = result_struct_to_msg(final_result)
-            self.get_logger().info(print_result(final_result))
+            # self.get_logger().info(print_result(final_result))
             # Play audio
             if self.PLAY_AUDIO:
                 self._play_stream(final_audio.output_audio)
