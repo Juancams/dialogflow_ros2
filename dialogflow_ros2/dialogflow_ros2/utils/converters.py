@@ -15,7 +15,7 @@ def parameters_struct_to_msg(parameters):
     :return: List of DF Param msgs or empty list
     :rtype: (list of DialogflowParameter) or None
     """
-    if parameters.items():
+    if parameters is not None and parameters.items():
         param_list = []
         for name, value in parameters.items():
             name_utf8 = name
