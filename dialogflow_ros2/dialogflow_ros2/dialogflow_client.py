@@ -33,7 +33,7 @@ import signal
 
 import time
 from uuid import uuid4
-from yaml import load, YAMLError
+from yaml import load, YAMLError, Loader
 import pathlib
 
 # ROS 2
@@ -77,7 +77,7 @@ class DialogflowClient(Node):
 
         with open(file_dir, 'r') as f:
             try:
-                self.phrase_hints = load(f)
+                self.phrase_hints = load(f, Loader=Loader)
             except YAMLError:
                 self.phrase_hints = []
 
